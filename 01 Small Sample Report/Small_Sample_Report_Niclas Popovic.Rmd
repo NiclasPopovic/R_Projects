@@ -1,0 +1,974 @@
+---
+title: "Data Analytics Popovic"
+author: "Alexander Niclas Popovic"
+date: "2023-07-16"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+## Introduction
+
+For this project, I utilize a portion of the data that I also use in my
+PhD thesis, which was obtained from my company Vytal. Vytal is a startup
+based in Cologne that provides a digital deposit-free reusable packaging
+system for take-out food and beverages. This system offers restaurants,
+canteens, supermarkets, and delivery services a convenient and
+sustainable packaging solution.
+
+Vytal employs serialized containers that are distinguished by a unique
+QR code on their lids. The process unfolds as follows: customers are
+required to download an app and register in order to access the reusable
+containers free of charge. When a customer places an order using the
+reusable containers, both the QR code on the lid and the QR code from
+the customer's app are scanned by the gastronomist. This allows for
+matching the container with the customer. Vytal operates on a
+pay-per-use business model. Whenever a container is issued from the
+gastronomist to a customer, Vytal charges the gastronomist a fee of
+€0.15 to €0.25, depending on the type of container.
+
+Vytal offers 13 different types of containers, which are grouped into 3
+classes. A restaurant has the flexibility to choose which classes of
+containers they will accept for return, but they must accept the classes
+from which they initially provided containers to their customers.
+Consequently, a customer can return their container to several stores
+within the network of Vytal-affiliated establishments. When a container
+is returned, only the QR code on the lid needs to be scanned in order to
+complete the return process. Subsequently, the container undergoes
+cleaning and is made available for the next customer.
+
+Thanks to the serialization, Vytal is able to collect item-level
+transactional data. This implies that each time a container is issued or
+returned, Vytal captures information such as the previous owner and the
+new owner of the container, along with the container type and a
+timestamp.
+
+For this project, I aggregate the data on a daily basis from three
+specific stores that I call Store 1, Store 2, and Store 3. The objective
+is to make predictions for both the containers returned by customers and
+those issued to customers for each store. Only one container type will
+be considered, which happens to be the top-selling type and accounts for
+approximately 85% of the revenue generated at these stores. The stores
+under consideration are canteens affiliated with one of the largest
+chemical companies in Germany. They operate from Monday to Friday,
+starting from 8 am and closing at 4 pm.
+
+The objective is to generate accurate daily forecasts for a two-week
+period ahead. These forecasts hold significant importance for Vytal as
+they assist in replenishment and inventory rebalancing operations. As we
+will explore further, the supply (returns) and customer demand are well
+balanced, resulting in infrequent inventory replenishment requirements.
+However, there are occasions when Vytal needs to transfer containers
+from one store to another to address high inventory levels.
+
+```{r, echo=FALSE, message=FALSE}
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(data.table)
+
+library(glmnet)
+library(randomForest)
+library(Metrics)
+
+
+```
+
+## Exploratory Data Analysis
+
+First, I load the realized demand and containers returned from each
+store. In the context of Vytal, a container that was issued to a
+customer is referred to as a "check-out" and a container that was
+returned by a customer is called a "check-in". I will use their
+terminology in this project.
+
+```{r}
+set.seed(187)
+
+df_store1_checkouts <- read.csv("store1 checkouts.csv",sep=";")
+str(df_store1_checkouts)
+df_store2_checkouts <- read.csv("store2 checkouts.csv",sep=";")
+str(df_store2_checkouts)
+df_store3_checkouts <- read.csv("store3 checkouts.csv",sep=";")
+str(df_store3_checkouts)
+```
+
+For the check-outs, I have 684 observations (days) starting from
+07.09.2020 for the first store. As for the second and third stores, I
+have 677 observations starting from 10.09.2020 and 14.09.2020,
+respectively.
+
+```{r}
+df_store1_checkins <- read.csv("store1 checkins.csv",sep=";")
+str(df_store1_checkins)
+df_store2_checkins <- read.csv("store2 checkins.csv",sep=";")
+str(df_store2_checkins)
+df_store3_checkins <- read.csv("store3 checkins.csv",sep=";")
+str(df_store3_checkins)
+```
+
+For the checkins, I have 683 observations (days) starting from
+08.09.2020 for the first store. As for the second and third stores, I
+have 677 observations starting from 09.10.2020. The reason for this
+difference of 684 observations for checkouts and 683 for check-ins is
+that the check-outs took place first, and for Store 1, there were no
+checkins on the first day when Vytal was in operation.
+
+I have already performed some pre-processing and feature engineering on
+the data, which will be explained below. However, further feature
+engineering will be conducted later in the project. Each dataset
+contains up to 16 columns with the following explanations:
+
+| Variable                  | Explanation                                                                                              |
+|-------------------|-----------------------------------------------------|
+| date                      | The corresponding day when the data was collected.                                                       |
+| checkins                  | The number of check-ins made on that day.                                                                |
+| checkouts                 | The number of check-outs made on that day.                                                               |
+| weekends                  | 1 if the day falls on a weekend, 0 otherwise.                                                            |
+| public_holiday            | 1 if the day is a public holiday, 0 otherwise.                                                           |
+| bridge_days               | 1 if the day is a possible bridging day, 0 otherwise.                                                    |
+| before_public_holiday     | 1 if the day is the day before a public holiday, 0 otherwise.                                            |
+| after_public_holiday      | 1 if the day is the day after a public holiday, 0 otherwise.                                             |
+| school_holidays_easter    | 1 if the day is during the Easter school holidays in Germany, 0 otherwise.                               |
+| school_holidays_summer    | 1 if the day is during the summer school holidays in Germany, 0 otherwise.                               |
+| school_holidays_autumn    | 1 if the day is during the autumn school holidays in Germany, 0 otherwise.                               |
+| school_holidays_winter    | 1 if the day is during the winter school holidays in Germany, 0 otherwise.                               |
+| pre_school_days           | 1 if the day falls within the 14-day period before school holidays.                                      |
+| cov_law                   | 1 if local COVID-19 regulations were in effect, affecting the business in terms of selling restrictions. |
+| christmas_season          | 1 if the day is close to Christmas or New Year's Eve, 0 otherwise.                                       |
+| public_holiday_week_after | Used as a sanity check, as discussed by Huber & Stuckenschmidt (2020).                                   |
+| tracking_wrong            | Relevant only for store 2 and 3, indicating a problem with scanning devices between the two stores.      |
+
+First of all, lets plot the check-outs and check-ins for all stores. We
+have to convert the date column to a date datatype and index.
+
+I will use the most recent 6 weeks (30 days) of each data set as the
+test data, and the remaining data will be used as the training data set.
+The exploratory data analysis will be done with the training set
+
+```{r}
+# I transform the string column to an appropriate date column
+df_store1_checkouts$date <- as.Date(df_store1_checkouts$date, format="%d.%m.%y")
+df_store2_checkouts$date <- as.Date(df_store2_checkouts$date, format="%d.%m.%y")
+df_store3_checkouts$date <- as.Date(df_store3_checkouts$date, format="%d.%m.%y")
+
+df_store1_checkins$date <- as.Date(df_store1_checkins$date, format="%d.%m.%y")
+df_store2_checkins$date <- as.Date(df_store2_checkins$date, format="%d.%m.%y")
+df_store3_checkins$date <- as.Date(df_store3_checkins$date, format="%d.%m.%y")
+
+df_store1_checkouts <- df_store1_checkouts[df_store1_checkouts$weekends == 0, ]
+df_store2_checkouts <- df_store2_checkouts[df_store2_checkouts$weekends == 0, ]
+df_store3_checkouts <- df_store3_checkouts[df_store3_checkouts$weekends == 0, ]
+
+df_store1_checkins <- df_store1_checkins[df_store1_checkins$weekends == 0, ]
+df_store2_checkins <- df_store2_checkins[df_store2_checkins$weekends == 0, ]
+df_store3_checkins <- df_store3_checkins[df_store3_checkins$weekends == 0, ]
+
+# Split of training and test data
+df_store1_checkouts_test <- tail(df_store1_checkouts,10)
+df_store1_checkouts_training <- head(df_store1_checkouts,-10)
+df_store2_checkouts_test <- tail(df_store2_checkouts,10)
+df_store2_checkouts_training <- head(df_store2_checkouts,-10)
+df_store3_checkouts_test <- tail(df_store3_checkouts,10)
+df_store3_checkouts_training <- head(df_store3_checkouts,-10)
+
+df_store1_checkins_test <- tail(df_store1_checkins,10)
+df_store1_checkins_training <- head(df_store1_checkins,-10)
+df_store2_checkins_test <- tail(df_store2_checkins,10)
+df_store2_checkins_training <- head(df_store2_checkins,-10)
+df_store3_checkins_test <- tail(df_store3_checkins,10)
+df_store3_checkins_training <- head(df_store3_checkins,-10)
+
+# Merged dataframe makes it easier to plot the data
+df_merged_store_1 <- merge(df_store1_checkouts_training[, c("date", "checkouts")],df_store1_checkins_training[, c("date", "checkins")], by = "date", all = TRUE)
+# Fill the missing value for checkins with 0
+df_merged_store_1$checkins[is.na(df_merged_store_1$checkins)] <- 0
+df_merged_store_2 <- merge(df_store2_checkouts_training[, c("date", "checkouts")],df_store2_checkins_training[, c("date", "checkins")], by = "date", all = TRUE)
+df_merged_store_3 <- merge(df_store3_checkouts_training[, c("date", "checkouts")],df_store3_checkins_training[, c("date", "checkins")], by = "date", all = TRUE)
+```
+
+```{r,fig.width=10,echo=FALSE}
+blue <- "#0072B2"
+orange <- "#D55E00"
+custom_colors <- c(blue,orange)
+# Plot store 1 
+ggplot(df_merged_store_1, aes(x = date)) +
+  geom_line(aes(y = checkouts, color = "Checkouts"), ) +
+  geom_line(aes(y = checkins, color = "Checkins"), ) +
+  labs(x = "Date", y = "Count", color = "Variable", title = "Store 1") +
+  scale_color_manual(values = custom_colors) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_blank(),
+    legend.box = "vertical",
+    legend.key.height = unit(1, "line"),
+    legend.key.width = unit(2, "line"),
+    legend.text = element_text(vjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5) 
+  )
+```
+
+```{r,,fig.width=10,echo=FALSE}
+# Plot store 2
+ggplot(df_merged_store_2, aes(x = date)) +
+  geom_line(aes(y = checkouts, color = "Checkouts"), ) +
+  geom_line(aes(y = checkins, color = "Checkins"), ) +
+  labs(x = "Date", y = "Count", color = "Variable", title = "Store 2") +
+  scale_color_manual(values = custom_colors) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_blank(),
+    legend.box = "vertical",
+    legend.key.height = unit(1, "line"),
+    legend.key.width = unit(2, "line"),
+    legend.text = element_text(vjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5) 
+  )
+```
+
+```{r,fig.width=10,echo=FALSE}
+# Plot store 3 
+ggplot(df_merged_store_3, aes(x = date)) +
+  geom_line(aes(y = checkouts, color = "Checkouts"), ) +
+  geom_line(aes(y = checkins, color = "Checkins"), ) +
+  labs(x = "Date", y = "Count", color = "Variable", title = "Store 3") +
+  scale_color_manual(values = custom_colors) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_blank(),
+    legend.box = "vertical",
+    legend.key.height = unit(1, "line"),
+    legend.key.width = unit(2, "line"),
+    legend.text = element_text(vjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5) 
+  )
+```
+
+Based on these plots, we observe several patterns. Firstly, it appears
+that the daily checkouts and checkins are fairly balanced. Secondly,
+there is a significant decrease in the number of both checkins and
+checkouts around Christmas and New Year's Eve. Thirdly, during the
+summer of 2021, we observe a sharp decrease in checkouts and checkins
+for store 2, while store 3 shows very high levels. To account for this
+event, we introduced a dummy variable as mentioned above. It is worth
+noting that the scanning devices from store 3 were used in both store 2
+and store 3, as they are located on the same campus. Lastly, we notice
+that all stores are closed on specific days, most likely weekends, which
+is further supported by examining the percentage of checkouts and
+checkins made during weekends.
+
+```{r}
+mask <- df_store1_checkouts_training$weekends == 1
+(sum(df_store1_checkouts_training$checkouts[mask]) / sum(df_store1_checkouts_training$checkouts))*100
+mask <- df_store1_checkins_training$weekends == 1
+(sum(df_store1_checkins_training$checkins[mask]) / sum(df_store1_checkins_training$checkins))*100
+
+mask <- df_store2_checkouts_training$weekends == 1
+(sum(df_store2_checkouts_training$checkouts[mask]) / sum(df_store2_checkouts_training$checkouts))*100
+mask <- df_store2_checkins_training$weekends == 1
+(sum(df_store2_checkins_training$checkins[mask]) / sum(df_store2_checkins_training$checkins))*100
+
+mask <- df_store3_checkouts_training$weekends == 1
+(sum(df_store3_checkouts_training$checkouts[mask]) / sum(df_store3_checkouts_training$checkouts))*100
+mask <- df_store3_checkins_training$weekends == 1
+(sum(df_store3_checkins_training$checkins[mask]) / sum(df_store3_checkins_training$checkins))*100
+```
+
+Based on the data, one can observe that there are only check-outs and
+check-ins for store 1 that occurred during the weekend. However, the
+number of such transactions is less than 1% of the total check-outs and
+check-ins, respectively. There could be various reasons for these
+weekend transactions, such as special opening hours, scans made during
+training sessions for staff, inventory checks, or other factors.
+However, it is important to note that this is not a regular pattern and
+can also be confirmed based on the accessible opening hours from the
+firm's master data database, and therefore I exclude the weekends for
+all three stores in my analysis.
+
+Next, we want to analyze if there are weekly patterns.
+
+```{r,echo=FALSE}
+df_store1_checkouts_training$dayoftheweek <- weekdays(df_store1_checkouts_training$date)
+df_store1_checkins_training$dayoftheweek <- weekdays(df_store1_checkins_training$date)
+df_store2_checkouts_training$dayoftheweek <- weekdays(df_store2_checkouts_training$date)
+df_store2_checkins_training$dayoftheweek <- weekdays(df_store2_checkins_training$date)
+df_store3_checkouts_training$dayoftheweek <- weekdays(df_store3_checkouts_training$date)
+df_store3_checkins_training$dayoftheweek <- weekdays(df_store3_checkins_training$date)
+```
+
+```{r,fig.width=10, echo=TRUE}
+day_order <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
+width = 0.5
+# Store 1
+ggplot(df_store1_checkouts_training, aes(x = dayoftheweek, y = checkouts, fill = "Store 1")) +
+  geom_boxplot(position = position_dodge(width = width), fill = orange) +
+  labs(x = "Day of the Week", y = "Check-outs", title = "Check-outs per Day Store 1") +
+  scale_x_discrete(limits = day_order) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r,fig.width=10, echo=TRUE}
+ggplot(df_store1_checkins_training, aes(x = dayoftheweek, y = checkins, fill = "Store 1")) +
+  geom_boxplot(position = position_dodge(width = width), fill = blue) +
+  labs(x = "Day of the Week", y = "Check-ins", title = "Check-ins per Day Store 1") +
+  scale_x_discrete(limits = day_order) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+For Store 1, we observed only one outlier above the median for check-ins
+and check-outs. However, there are several outliers where the check-ins
+or check-outs are zero. These occurrences correspond to public holidays.
+Additionally, there are outliers below the median that are associated
+with the period around Christmas and New Year's Eve. Furthermore, it is
+noticeable that Friday is the weakest day of the week in terms of
+transactions. This finding is logical as people may be working from
+home, have the day off, or prefer not to borrow a container over the
+weekend, among other reasons.
+
+```{r,fig.width=10, echo=FALSE}
+# Store 2
+ggplot(df_store2_checkouts_training, aes(x = dayoftheweek, y = checkouts, fill = "Store 2")) +
+  geom_boxplot(position = position_dodge(width = width), fill = orange) +
+  labs(x = "Day of the Week", y = "Check-outs", title = "Check-outs per Day Store 2") +
+  scale_x_discrete(limits = day_order) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r,fig.width=10, echo=FALSE}
+ggplot(df_store2_checkins_training, aes(x = dayoftheweek, y = checkins, fill = "Store 1")) +
+  geom_boxplot(position = position_dodge(width = width), fill = blue) +
+  labs(x = "Day of the Week", y = "Check-ins", title = "Check-ins per Day Store 2") +
+  scale_x_discrete(limits = day_order) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+For Store 2, it is also evident that there are three outliers above the
+median, two for check-outs, and one for check-ins. Similarly, noticeable
+outliers are associated with public holidays and the Christmas period.
+Moreover, outliers can be attributed to the period when the scanning
+devices from Store 3 were used in Store 2. Additionally, Friday
+continues to be the least busy day of the week for this store as well.
+
+```{r,fig.width=10, echo=FALSE}
+# Store 3
+ggplot(df_store3_checkouts_training, aes(x = dayoftheweek, y = checkouts, fill = "Store 3")) +
+  geom_boxplot(position = position_dodge(width = width), fill = orange) +
+  labs(x = "Day of the Week", y = "Check-outs", title = "Check-outs per Day Store 3") +
+  scale_x_discrete(limits = day_order) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r,fig.width=10, echo=FALSE}
+ggplot(df_store3_checkins_training, aes(x = dayoftheweek, y = checkins, fill = "Store 1")) +
+  geom_boxplot(position = position_dodge(width = width), fill = blue) +
+  labs(x = "Day of the Week", y = "Check-ins", title = "Check-ins per Day Store 3") +
+  scale_x_discrete(limits = day_order) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+For Store 3, the pattern observed is slightly different from the other stores. There are several outliers above the median, which can be attributed to scanning issues at Store 2. Additionally, outliers are present during public holidays when the store is closed and during the Christmas period when only a few customers visit the store. Similar to the other stores, Fridays remain the weakest day of the week for Store 3.
+
+The boxplots provided above highlight a consistent weekly pattern for all three stores, with a noticeable decrease in volume on Fridays and a gradual increase throughout the week. This pattern seems to be significant and can be captured using feature engineering techniques. One approach could be developing a feature using radial basis functions to represent this weekly pattern accurately.
+
+The next question that arises is whether there might be multiple seasonal patterns in the data. In addition to the weekly pattern, it is important to analyze if there are any monthly or annual seasonality patterns. However, due to the limitations of our dataset, it is challenging to analyze annual patterns comprehensively. Nevertheless, it is still worthwhile to explore possible monthly patterns in the data.
+
+To assess the presence of multiple seasonal patterns, I will employ the multiple seasonal decomposition algorithm proposed by Bandara et al. (2021), which is implemented in the *forecast* package. This decomposition approach can help identify and analyze any potential monthly patterns in the data.
+
+```{r}
+# For illustrational purposes I hide the x-axis labels
+x <- ts(df_store1_checkouts_training$checkouts, start = min(df_store1_checkouts_training$date), frequency=5)
+x <- msts(x, seasonal.periods = c(5, 365.25*5/7/12))
+mstl(x) %>% autoplot() + labs(title="Store 1 Check-outs") + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(),plot.title = element_text(hjust = 0.5)) 
+
+x <- ts(df_store1_checkins_training$checkins, start = min(df_store1_checkins_training$date), frequency=5)
+x <- msts(x, seasonal.periods = c(5, 365.25*5/7/12))
+mstl(x) %>% autoplot() + labs(title="Store 1 Check-ins") + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(),plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+x <- ts(df_store2_checkouts_training$checkouts, start = min(df_store2_checkouts_training$date), frequency=5)
+x <- msts(x, seasonal.periods = c(5, 365.25*5/7/12))
+mstl(x) %>% autoplot() + labs(title="Store 2 Check-outs") + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(), plot.title = element_text(hjust = 0.5)) 
+
+x <- ts(df_store2_checkins_training$checkins, start = min(df_store2_checkins_training$date), frequency=5)
+x <- msts(x, seasonal.periods = c(5, 365.25*5/7/12))
+mstl(x) %>% autoplot() + labs(title="Store 2 Check-ins") + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(), plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+x <- ts(df_store3_checkouts_training$checkouts, start = min(df_store3_checkouts_training$date), frequency=5)
+x <- msts(x, seasonal.periods = c(5, 365.25*5/7/12))
+mstl(x) %>% autoplot() + labs(title="Store 3 Check-outs") + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(), plot.title = element_text(hjust = 0.5)) 
+
+x <- ts(df_store3_checkins_training$checkins, start = min(df_store3_checkins_training$date), frequency=5)
+x <- msts(x, seasonal.periods = c(5, 365.25*5/7/12))
+mstl(x) %>% autoplot() + labs(title="Store 3 Check-ins") + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(), plot.title = element_text(hjust = 0.5))
+
+```
+
+The figures above depict the seasonal decomposition for all six time
+series. In these graphs, we can once again observe a weekly pattern as
+well as a monthly pattern. These patterns will be significant during the
+feature engineering phase. Furthermore, the data exhibits an initial
+increasing trend followed by a decreasing trend. Additionally,
+noticeable outliers can be observed during public holidays. In
+conclusion, we are faced with the issue of multi-seasonality, which we
+will address in the feature engineering stage.
+
+## Feature Engineering
+
+In order to incorporate both weekly and monthly patterns in our
+analysis, we can utilize radial basis functions (RBFs) (see, e.g., Sheta
+& De Jong, 2001). One of the commonly used RBFs is the Gaussian kernel,
+defined as follows:
+
+$$
+\phi_j(x_{i}) = \exp\bigg[-\frac {(x_{i} - c_j)^2}{2 h_j^2}\bigg],
+$$ where $x_i$ is the day of the week or day of the month, $c_j$ are the
+centers of the radial basis functions, and $h_j^2$ width of the kernel
+*j*.
+
+For the weekly pattern, we require five kernels, one for each business
+day of the week. The center $c_j$ for each kernel is set to the
+respective day of the week (e.g., $c_j = j$ for Monday through Friday).
+
+For the monthly pattern, we can have up to 31 kernels, considering the
+maximum number of days in a month. However, it's important to note that
+not all months have 31 days obviously. Similarly, the center $c_j$ for
+each kernel is set to the respective day of the month.
+
+By using these RBFs, we can capture both weekly and monthly patterns in
+our analysis effectively. Note that there are optimization algorithms to
+find the "optimal" parameters for the RBF. However, here I keep it
+simple and use a width of based on some simple grid search that I did.
+
+```{r}
+# Compute day of the week & month
+df_store1_checkouts_training$dayoftheweek <- as.factor(match(df_store1_checkouts_training$dayoftheweek, weekdays(df_store1_checkouts_training$date)))
+df_store2_checkouts_training$dayoftheweek <- as.factor(match(df_store2_checkouts_training$dayoftheweek, weekdays(df_store2_checkouts_training$date)))
+df_store3_checkouts_training$dayoftheweek <- as.factor(match(df_store3_checkouts_training$dayoftheweek, weekdays(df_store3_checkouts_training$date)))
+
+df_store1_checkins_training$dayoftheweek <- as.factor(match(df_store1_checkins_training$dayoftheweek, weekdays(df_store1_checkins_training$date)))
+df_store2_checkins_training$dayoftheweek <- as.factor(match(df_store2_checkins_training$dayoftheweek, weekdays(df_store2_checkins_training$date)))
+df_store3_checkins_training$dayoftheweek <- as.factor(match(df_store3_checkins_training$dayoftheweek, weekdays(df_store3_checkins_training$date)))
+
+df_store1_checkouts_training$dayofthemonth <- as.factor(day(df_store1_checkouts_training$date))
+df_store2_checkouts_training$dayofthemonth <- as.factor(day(df_store2_checkouts_training$date))
+df_store3_checkouts_training$dayofthemonth <- as.factor(day(df_store3_checkouts_training$date))
+
+df_store1_checkins_training$dayofthemonth <- as.factor(day(df_store1_checkins_training$date))
+df_store2_checkins_training$dayofthemonth <- as.factor(day(df_store2_checkins_training$date))
+df_store3_checkins_training$dayofthemonth <- as.factor(day(df_store3_checkins_training$date))
+
+df_store1_checkouts_training$month <- month(df_store1_checkouts_training$date)
+df_store2_checkouts_training$month <- month(df_store2_checkouts_training$date)
+df_store3_checkouts_training$month <- month(df_store3_checkouts_training$date)
+
+df_store1_checkins_training$month <- month(df_store1_checkins_training$date)
+df_store2_checkins_training$month <- month(df_store2_checkins_training$date)
+df_store3_checkins_training$month <- month(df_store3_checkins_training$date)
+```
+
+```{r}
+# Radial basic function
+width <- 1  # Width parameter
+
+# Compute repeating basis functions
+
+compute_rbf <- function(df_data, day_series, centers, h, saison = "weekly") {
+  n <- length(day_series)
+  x = 0 
+  if (saison == "weekly"){
+    k <- 5
+  }
+  else if(saison == "monthly") {
+    k <- 31
+  }
+  df_with_rbf <- data.frame(df_data)
+  Phi <- matrix(0, n, k)
+  
+  for (j in 1:k) {
+  for (i in 1:n) {
+      if (saison == "weekly")
+      {
+        Phi[i, j] <- exp(-(as.integer(df_with_rbf$dayoftheweek[i]) - centers[j])^2 / (2 * h^2))
+      }
+      else if (saison == "monthly")
+      {
+        # df_with_rbf$month = index of the centers
+        Phi[i, j] <- exp(-(as.integer(df_with_rbf$dayofthemonth[i]) - centers[j])^2 / (2 * h^2))
+      }
+  }
+  }
+
+  if (saison == "weekly") { colnames(Phi) <- paste0("DayOfTheWeek", seq(1, 5)) } 
+  else if (saison == "monthly")
+    { 
+      colnames(Phi) <- paste0("DayOfTheMonth", seq(1, 31)) 
+  } 
+  df_with_rbf <- cbind(df_with_rbf, Phi)
+  if (saison == "weekly") 
+    { 
+     df_with_rbf <- df_with_rbf[, -which(names(df_with_rbf) == "dayoftheweek")]
+     df_with_rbf <- df_with_rbf[, -which(names(df_with_rbf) == "month")]
+    } 
+  else if (saison == "monthly")
+    { 
+     df_with_rbf <- df_with_rbf[, -which(names(df_with_rbf) == "dayofthemonth")]
+     df_with_rbf <- df_with_rbf[, -which(names(df_with_rbf) == "month")]
+    } 
+ 
+  return(data_frame(df_with_rbf))
+}
+
+```
+
+```{r}
+df_weekly <- compute_rbf(df_store1_checkouts_training,df_store1_checkouts_training$dayoftheweek,c(1,2,3,4,5), width, "weekly")
+df_weekly <- df_weekly[, -which(names(df_weekly) == "DayOfTheWeek1")]
+
+model <- lm(checkouts ~ DayOfTheWeek2 + DayOfTheWeek3 + DayOfTheWeek4 + DayOfTheWeek5, data = df_weekly)
+predictions <- predict(model, newdata = df_weekly)
+
+summary(model)
+
+plot_data <- data.frame( date = df_weekly$date, actual = df_weekly$checkouts, predicted = predictions )
+
+plot(actual ~ date, data = plot_data, type = "l", col = "blue", xlab =
+"Date", ylab = "Checkout", main = "Actual vs Predicted Checkout")
+lines(predicted ~ date, data = plot_data, col = "red")
+legend("topright", legend = c("Actual", "Predicted"), col = c("blue",
+"red"), lty = 1)
+```
+
+We observe that the radial basis function effectively models the weekly pattern in the data. It's important to note that at this stage, we are assessing the in-sample accuracy, which evaluates how well the model fits the observed data. Later on, we will make out-of-sample predictions to evaluate the predictive performance of different algorithms.
+```{r}
+
+
+df_monthly <- compute_rbf(df_store1_checkouts_training,df_store1_checkouts_training$dayofthemonth,c(seq(1,31)), width, "monthly")
+df_merged <- merge(df_monthly, df_weekly[c("date", "DayOfTheWeek2","DayOfTheWeek3","DayOfTheWeek4","DayOfTheWeek5")], by = "date")
+df_merged <- df_merged[, -which(names(df_merged) == "DayOfTheMonth1")]
+df_merged <- df_merged[, -which(names(df_merged) == "dayoftheweek")]
+
+model <- lm(checkouts ~ DayOfTheWeek2 + DayOfTheWeek3 + DayOfTheWeek4 + DayOfTheWeek5 +
+                  DayOfTheMonth2 + DayOfTheMonth3 + DayOfTheMonth4 + DayOfTheMonth5 +
+                  DayOfTheMonth6 + DayOfTheMonth7 + DayOfTheMonth8 + DayOfTheMonth9 +
+                  DayOfTheMonth10 + DayOfTheMonth11 + DayOfTheMonth12 + DayOfTheMonth13 +
+                  DayOfTheMonth14 + DayOfTheMonth15 + DayOfTheMonth16 + DayOfTheMonth17 +
+                  DayOfTheMonth18 + DayOfTheMonth19 + DayOfTheMonth20 + DayOfTheMonth21 +
+                  DayOfTheMonth22 + DayOfTheMonth23 + DayOfTheMonth24 + DayOfTheMonth25 +
+                  DayOfTheMonth26 + DayOfTheMonth27 + DayOfTheMonth28 + DayOfTheMonth29 +
+                  DayOfTheMonth30 + DayOfTheMonth31,
+            data = df_merged)
+
+summary(model)
+predictions <- predict(model, newdata = df_merged)
+
+plot_data <- data.frame( date = df_merged$date, actual = df_merged$checkouts, predicted = predictions )
+
+plot(actual ~ date, data = plot_data, type = "l", col = "blue", xlab =
+"Date", ylab = "Checkout", main = "Actual vs Predicted Checkout")
+lines(predicted ~ date, data = plot_data, col = "red")
+legend("topright", legend = c("Actual", "Predicted"), col = c("blue",
+"red"), lty = 1)
+
+
+```
+
+It is important to note that in this OLS model, none of the days are statistically significant. However, this does not necessarily mean that these features lack predictive power. The model has become more flexible in terms of capturing seasonality patterns.
+
+Moving forward, I will include additional variables related to holidays and public holidays. These variables will provide more information about the impact of specific holidays on the check-out volume, allowing one to account for any seasonality associated with those events.
+
+```{r}
+
+model <- lm(checkouts ~ DayOfTheWeek2 + DayOfTheWeek3 + DayOfTheWeek4 + DayOfTheWeek5 +
+                  DayOfTheMonth2 + DayOfTheMonth3 + DayOfTheMonth4 + DayOfTheMonth5 +
+                  DayOfTheMonth6 + DayOfTheMonth7 + DayOfTheMonth8 + DayOfTheMonth9 +
+                  DayOfTheMonth10 + DayOfTheMonth11 + DayOfTheMonth12 + DayOfTheMonth13 +
+                  DayOfTheMonth14 + DayOfTheMonth15 + DayOfTheMonth16 + DayOfTheMonth17 +
+                  DayOfTheMonth18 + DayOfTheMonth19 + DayOfTheMonth20 + DayOfTheMonth21 +
+                  DayOfTheMonth22 + DayOfTheMonth23 + DayOfTheMonth24 + DayOfTheMonth25 +
+                  DayOfTheMonth26 + DayOfTheMonth27 + DayOfTheMonth28 + DayOfTheMonth29 +
+                  DayOfTheMonth30 + DayOfTheMonth31 + public_holiday + bridge_days + before_public_holiday + after_public_holiday + christmas_season,
+            data = df_merged)
+
+summary(model)
+predictions <- predict(model, newdata = df_merged)
+
+plot_data <- data.frame( date = df_merged$date, actual = df_merged$checkouts, predicted = predictions )
+
+plot(actual ~ date, data = plot_data, type = "l", col = "blue", xlab =
+"Date", ylab = "Checkout", main = "Actual vs Predicted Checkout")
+lines(predicted ~ date, data = plot_data, col = "red")
+legend("topright", legend = c("Actual", "Predicted"), col = c("blue",
+"red"), lty = 1)
+```
+
+As expected, holidays have a significant impact on the check-outs and check-ins, as their values are consistently zero during those periods, making them perfectly predictable. However, the current model still faces challenges in capturing certain aspects of the time series. One factor that has not  been utilized is the autoregressive properties of the time series, which I excluded here.
+
+```{r}
+# We do not need this feature
+df_merged <- df_merged %>% select(-weekends)
+
+model <- lm(checkouts ~. -date,
+            data = df_merged)
+
+summary(model)
+predictions <- predict(model, newdata = df_merged)
+
+plot_data <- data.frame( date = df_merged$date, actual = df_merged$checkouts, predicted = predictions )
+
+plot(actual ~ date, data = plot_data, type = "l", col = "blue", xlab =
+"Date", ylab = "Checkout", main = "Actual vs Predicted Checkout")
+lines(predicted ~ date, data = plot_data, col = "red")
+legend("topright", legend = c("Actual", "Predicted"), col = c("blue",
+"red"), lty = 1)
+```
+
+After incorporating all the aforementioned features into the OLS model, one can observe an improvement in the model's fit. Notably, the variable "pre_school_holidays," which represents the period 2 weeks or 10 business days before the start of school holidays, has a significant negative effect on check-outs at a 5% confidence level. This negative effect can potentially be attributed to the 14-day loan period, where individuals anticipate going on holidays and realize they may not be able to return the containers on time, leading to a decrease in usage.
+
+Moving forward, I will proceed with analyzing the out-of-sample forecast accuracy for all three time series using different algorithms, namely OLS, seasonal ARIMA, and random forest.
+
+## Predictions task
+
+First of all, I prepare the test data set.
+
+```{r}
+
+df_weekly <- compute_rbf(df_store1_checkouts_training,df_store1_checkouts_training$dayoftheweek,c(1,2,3,4,5), width, "weekly")
+df_weekly <- df_weekly[, -which(names(df_weekly) == "DayOfTheWeek1")]
+df_monthly <- compute_rbf(df_store1_checkouts_training,df_store1_checkouts_training$dayofthemonth,c(seq(1,31)), width, "monthly")
+df_merged <- merge(df_monthly, df_weekly[c("date", "DayOfTheWeek2","DayOfTheWeek3","DayOfTheWeek4","DayOfTheWeek5")], by = "date")
+df_merged <- df_merged[, -which(names(df_merged) == "DayOfTheMonth1")]
+df_store1_checkouts_training <- df_merged[, -which(names(df_merged) == "dayoftheweek")]
+
+df_weekly <- compute_rbf(df_store2_checkouts_training,df_store2_checkouts_training$dayoftheweek,c(1,2,3,4,5), width, "weekly")
+df_weekly <- df_weekly[, -which(names(df_weekly) == "DayOfTheWeek1")]
+df_monthly <- compute_rbf(df_store2_checkouts_training,df_store2_checkouts_training$dayofthemonth,c(seq(1,31)), width, "monthly")
+df_merged <- merge(df_monthly, df_weekly[c("date", "DayOfTheWeek2","DayOfTheWeek3","DayOfTheWeek4","DayOfTheWeek5")], by = "date")
+df_merged <- df_merged[, -which(names(df_merged) == "DayOfTheMonth1")]
+df_store2_checkouts_training <- df_merged[, -which(names(df_merged) == "dayoftheweek")]
+
+df_weekly <- compute_rbf(df_store3_checkouts_training,df_store3_checkouts_training$dayoftheweek,c(1,2,3,4,5), width, "weekly")
+df_weekly <- df_weekly[, -which(names(df_weekly) == "DayOfTheWeek1")]
+df_monthly <- compute_rbf(df_store3_checkouts_training,df_store3_checkouts_training$dayofthemonth,c(seq(1,31)), width, "monthly")
+df_merged <- merge(df_monthly, df_weekly[c("date", "DayOfTheWeek2","DayOfTheWeek3","DayOfTheWeek4","DayOfTheWeek5")], by = "date")
+df_merged <- df_merged[, -which(names(df_merged) == "DayOfTheMonth1")]
+df_store3_checkouts_training <- df_merged[, -which(names(df_merged) == "dayoftheweek")]
+
+df_weekly <- compute_rbf(df_store1_checkins_training,df_store1_checkins_training$dayoftheweek,c(1,2,3,4,5), width, "weekly")
+df_weekly <- df_weekly[, -which(names(df_weekly) == "DayOfTheWeek1")]
+df_monthly <- compute_rbf(df_store1_checkins_training,df_store1_checkins_training$dayofthemonth,c(seq(1,31)), width, "monthly")
+df_merged <- merge(df_monthly, df_weekly[c("date", "DayOfTheWeek2","DayOfTheWeek3","DayOfTheWeek4","DayOfTheWeek5")], by = "date")
+df_merged <- df_merged[, -which(names(df_merged) == "DayOfTheMonth1")]
+df_store1_checkins_training <- df_merged[, -which(names(df_merged) == "dayoftheweek")]
+
+df_weekly <- compute_rbf(df_store2_checkins_training,df_store2_checkins_training$dayoftheweek,c(1,2,3,4,5), width, "weekly")
+df_weekly <- df_weekly[, -which(names(df_weekly) == "DayOfTheWeek1")]
+df_monthly <- compute_rbf(df_store2_checkins_training,df_store2_checkins_training$dayofthemonth,c(seq(1,31)), width, "monthly")
+df_merged <- merge(df_monthly, df_weekly[c("date", "DayOfTheWeek2","DayOfTheWeek3","DayOfTheWeek4","DayOfTheWeek5")], by = "date")
+df_merged <- df_merged[, -which(names(df_merged) == "DayOfTheMonth1")]
+df_store2_checkins_training <- df_merged[, -which(names(df_merged) == "dayoftheweek")]
+
+df_weekly <- compute_rbf(df_store3_checkins_training,df_store3_checkins_training$dayoftheweek,c(1,2,3,4,5), width, "weekly")
+df_weekly <- df_weekly[, -which(names(df_weekly) == "DayOfTheWeek1")]
+df_monthly <- compute_rbf(df_store3_checkins_training,df_store3_checkins_training$dayofthemonth,c(seq(1,31)), width, "monthly")
+df_merged <- merge(df_monthly, df_weekly[c("date", "DayOfTheWeek2","DayOfTheWeek3","DayOfTheWeek4","DayOfTheWeek5")], by = "date")
+df_merged <- df_merged[, -which(names(df_merged) == "DayOfTheMonth1")]
+df_store3_checkins_training <- df_merged[, -which(names(df_merged) == "dayoftheweek")]
+
+df_store1_checkouts_test$dayoftheweek <- weekdays(df_store1_checkouts_test$date)
+df_store1_checkins_test$dayoftheweek <- weekdays(df_store1_checkins_test$date)
+df_store2_checkouts_test$dayoftheweek <- weekdays(df_store2_checkouts_test$date)
+df_store2_checkins_test$dayoftheweek <- weekdays(df_store2_checkins_test$date)
+df_store3_checkouts_test$dayoftheweek <- weekdays(df_store3_checkouts_test$date)
+df_store3_checkins_test$dayoftheweek <- weekdays(df_store3_checkins_test$date)
+
+df_store1_checkouts_test$dayoftheweek <- as.factor(match(df_store1_checkouts_test$dayoftheweek, weekdays(df_store1_checkouts_test$date)))
+df_store2_checkouts_test$dayoftheweek <- as.factor(match(df_store2_checkouts_test$dayoftheweek, weekdays(df_store2_checkouts_test$date)))
+df_store3_checkouts_test$dayoftheweek <- as.factor(match(df_store3_checkouts_test$dayoftheweek, weekdays(df_store3_checkouts_training$date)))
+
+df_store1_checkins_test$dayoftheweek <- as.factor(match(df_store1_checkins_test$dayoftheweek, weekdays(df_store1_checkins_test$date)))
+df_store2_checkins_test$dayoftheweek <- as.factor(match(df_store2_checkins_test$dayoftheweek, weekdays(df_store2_checkins_test$date)))
+df_store3_checkins_test$dayoftheweek <- as.factor(match(df_store3_checkins_test$dayoftheweek, weekdays(df_store3_checkins_test$date)))
+
+df_store1_checkouts_test$dayofthemonth <- as.factor(day(df_store1_checkouts_test$date))
+df_store2_checkouts_test$dayofthemonth <- as.factor(day(df_store2_checkouts_test$date))
+df_store3_checkouts_test$dayofthemonth <- as.factor(day(df_store3_checkouts_test$date))
+
+df_store1_checkins_test$dayofthemonth <- as.factor(day(df_store1_checkins_test$date))
+df_store2_checkins_test$dayofthemonth <- as.factor(day(df_store2_checkins_test$date))
+df_store3_checkins_test$dayofthemonth <- as.factor(day(df_store3_checkins_test$date))
+
+df_store1_checkouts_test$month <- month(df_store1_checkouts_test$date)
+df_store2_checkouts_test$month <- month(df_store2_checkouts_test$date)
+df_store3_checkouts_test$month <- month(df_store3_checkouts_test$date)
+
+df_store1_checkins_test$month <- month(df_store1_checkins_test$date)
+df_store2_checkins_test$month <- month(df_store2_checkins_test$date)
+df_store3_checkins_test$month <- month(df_store3_checkins_test$date)
+
+df_weekly <- compute_rbf(df_store1_checkouts_test,df_store1_checkouts_test$dayoftheweek,c(1,2,3,4,5), width, "weekly")
+df_weekly <- df_weekly[, -which(names(df_weekly) == "DayOfTheWeek1")]
+df_monthly <- compute_rbf(df_store1_checkouts_test,df_store1_checkouts_test$dayofthemonth,c(seq(1,31)), width, "monthly")
+df_merged <- merge(df_monthly, df_weekly[c("date", "DayOfTheWeek2","DayOfTheWeek3","DayOfTheWeek4","DayOfTheWeek5")], by = "date")
+df_merged <- df_merged[, -which(names(df_merged) == "DayOfTheMonth1")]
+df_store1_checkouts_test <- df_merged[, -which(names(df_merged) == "dayoftheweek")]
+
+df_weekly <- compute_rbf(df_store2_checkouts_test,df_store2_checkouts_test$dayoftheweek,c(1,2,3,4,5), width, "weekly")
+df_weekly <- df_weekly[, -which(names(df_weekly) == "DayOfTheWeek1")]
+df_monthly <- compute_rbf(df_store2_checkouts_test,df_store2_checkouts_test$dayofthemonth,c(seq(1,31)), width, "monthly")
+df_merged <- merge(df_monthly, df_weekly[c("date", "DayOfTheWeek2","DayOfTheWeek3","DayOfTheWeek4","DayOfTheWeek5")], by = "date")
+df_merged <- df_merged[, -which(names(df_merged) == "DayOfTheMonth1")]
+df_store2_checkouts_test <- df_merged[, -which(names(df_merged) == "dayoftheweek")]
+
+df_weekly <- compute_rbf(df_store3_checkouts_test,df_store3_checkouts_test$dayoftheweek,c(1,2,3,4,5), width, "weekly")
+df_weekly <- df_weekly[, -which(names(df_weekly) == "DayOfTheWeek1")]
+df_monthly <- compute_rbf(df_store3_checkouts_test,df_store3_checkouts_test$dayofthemonth,c(seq(1,31)), width, "monthly")
+df_merged <- merge(df_monthly, df_weekly[c("date", "DayOfTheWeek2","DayOfTheWeek3","DayOfTheWeek4","DayOfTheWeek5")], by = "date")
+df_merged <- df_merged[, -which(names(df_merged) == "DayOfTheMonth1")]
+df_store3_checkouts_test <- df_merged[, -which(names(df_merged) == "dayoftheweek")]
+
+
+
+df_weekly <- compute_rbf(df_store1_checkins_test,df_store1_checkins_test$dayoftheweek,c(1,2,3,4,5), width, "weekly")
+df_weekly <- df_weekly[, -which(names(df_weekly) == "DayOfTheWeek1")]
+df_monthly <- compute_rbf(df_store1_checkins_test,df_store1_checkins_test$dayofthemonth,c(seq(1,31)), width, "monthly")
+df_merged <- merge(df_monthly, df_weekly[c("date", "DayOfTheWeek2","DayOfTheWeek3","DayOfTheWeek4","DayOfTheWeek5")], by = "date")
+df_merged <- df_merged[, -which(names(df_merged) == "DayOfTheMonth1")]
+df_store1_checkins_test <- df_merged[, -which(names(df_merged) == "dayoftheweek")]
+
+df_weekly <- compute_rbf(df_store2_checkins_test,df_store2_checkins_test$dayoftheweek,c(1,2,3,4,5), width, "weekly")
+df_weekly <- df_weekly[, -which(names(df_weekly) == "DayOfTheWeek1")]
+df_monthly <- compute_rbf(df_store2_checkins_test,df_store2_checkins_test$dayofthemonth,c(seq(1,31)), width, "monthly")
+df_merged <- merge(df_monthly, df_weekly[c("date", "DayOfTheWeek2","DayOfTheWeek3","DayOfTheWeek4","DayOfTheWeek5")], by = "date")
+df_merged <- df_merged[, -which(names(df_merged) == "DayOfTheMonth1")]
+df_store2_checkins_test <- df_merged[, -which(names(df_merged) == "dayoftheweek")]
+
+df_weekly <- compute_rbf(df_store3_checkins_test,df_store3_checkins_test$dayoftheweek,c(1,2,3,4,5), width, "weekly")
+df_weekly <- df_weekly[, -which(names(df_weekly) == "DayOfTheWeek1")]
+df_monthly <- compute_rbf(df_store3_checkins_test,df_store3_checkins_test$dayofthemonth,c(seq(1,31)), width, "monthly")
+df_merged <- merge(df_monthly, df_weekly[c("date", "DayOfTheWeek2","DayOfTheWeek3","DayOfTheWeek4","DayOfTheWeek5")], by = "date")
+df_merged <- df_merged[, -which(names(df_merged) == "DayOfTheMonth1")]
+df_store3_checkins_test <- df_merged[, -which(names(df_merged) == "dayoftheweek")]
+```
+
+I use the root mean squared error (RMSE) to evaluate each forecast.
+
+### OLS
+
+```{r}
+
+model_store1_checkouts <- lm(checkouts ~.,data = df_store1_checkouts_training)
+model_store2_checkouts <- lm(checkouts ~.,data = df_store2_checkouts_training)
+model_store3_checkouts <- lm(checkouts ~.,data = df_store3_checkouts_training)
+
+predictions_store1_checkouts <- predict(model, newdata = df_store1_checkouts_test)
+predictions_store2_checkouts <- predict(model, newdata = df_store2_checkouts_test)
+predictions_store2_checkouts <- predict(model, newdata = df_store3_checkouts_test)
+
+model_store1_checkins <- lm(checkins ~.,data = df_store1_checkins_training)
+model_store2_checkins <- lm(checkins ~.,data = df_store2_checkins_training)
+model_store3_checkins <- lm(checkins ~.,data = df_store3_checkins_training)
+
+predictions_store1_checkins <- predict(model, newdata = df_store1_checkins_test)
+predictions_store2_checkins <- predict(model, newdata = df_store2_checkins_test)
+predictions_store3_checkins <- predict(model, newdata = df_store3_checkins_test)
+
+rmse_store1_ols_checkouts <- rmse(predictions_store1_checkouts, df_store1_checkouts_test$checkouts)
+rmse_store2_ols_checkouts <- rmse(predictions_store2_checkouts, df_store2_checkouts_test$checkouts)
+rmse_store3_ols_checkouts <- rmse(predictions_store2_checkouts, df_store3_checkouts_test$checkouts)
+
+rmse_store1_ols_checkins<- rmse(predictions_store1_checkins, df_store1_checkins_test$checkins)
+rmse_store2_ols_checkins <- rmse(predictions_store2_checkins, df_store2_checkins_test$checkins)
+rmse_store3_ols_checkins <- rmse(predictions_store3_checkins, df_store3_checkins_test$checkins)
+
+cat("RMSE OLS Store1 Check-outs: ",round(rmse_store1_ols_checkouts,2))
+cat("RMSE OLS Store2 Check-outs: ",round(rmse_store2_ols_checkouts,2))
+cat("RMSE OLS Store3 Check-outs: ",round(rmse_store3_ols_checkouts,2))
+
+cat("RMSE OLS Store1 Check-outs: ",round(rmse_store1_ols_checkins,2))
+cat("RMSE OLS Store2 Check-outs: ",round(rmse_store2_ols_checkins,2))
+cat("RMSE OLS Store3 Check-outs: ",round(rmse_store3_ols_checkins,2))
+```
+
+### seasonal ARIMA
+
+To fit the ARIMA model, I utilize the stepwise algorithm (Hyndman & Khandakar, 2008), which is implemented in the forecast package. This algorithm is employed to determine the optimal parameters for both the seasonal and non-seasonal components of the ARIMA model. The 'auto_arima()' function is utilized to identify the best ARIMA model for the data, based on the Akaike Information Criterion (AIC). Additionally, it performs a Dickey-Fuller test to assess the need for differencing.
+
+This process helps one select the most suitable ARIMA model by considering various factors, such as model complexity and goodness-of-fit measures
+
+```{r}
+arima_model_store1_checkouts <- auto.arima(df_store1_checkouts_training$checkouts, seasonal = TRUE, test="adf", stepwise=TRUE)
+arima_model_store2_checkouts <- auto.arima(df_store2_checkouts_training$checkouts, seasonal = TRUE, test="adf", stepwise=TRUE)
+arima_model_store3_checkouts <- auto.arima(df_store3_checkouts_training$checkouts, seasonal = TRUE, test="adf", stepwise=TRUE)
+
+store1_predicted_arima_checkouts <- forecast(arima_model_store1_checkouts, h = 10)
+store2_predicted_arima_checkouts <- forecast(arima_model_store2_checkouts, h = 10)
+store3_predicted_arima_checkouts <- forecast(arima_model_store3_checkouts, h = 10)
+
+arima_model_store1_checkins <- auto.arima(df_store1_checkins_training$checkins, seasonal = TRUE, test="adf", stepwise=TRUE)
+arima_model_store2_checkins <- auto.arima(df_store2_checkins_training$checkins, seasonal = TRUE, test="adf", stepwise=TRUE)
+arima_model_store3_checkins <- auto.arima(df_store3_checkins_training$checkins, seasonal = TRUE, test="adf", stepwise=TRUE)
+
+store1_predicted_arima_checkins <- forecast(arima_model_store1_checkins, h = 10)
+store2_predicted_arima_checkins <- forecast(arima_model_store2_checkins, h = 10)
+store3_predicted_arima_checkins <- forecast(arima_model_store3_checkins, h = 10)
+
+rmse_store1_arima_checkouts <- rmse(store1_predicted_arima_checkouts$mean, df_store1_checkouts_test$checkouts)
+rmse_store2_arima_checkouts <- rmse(store2_predicted_arima_checkouts$mean, df_store2_checkouts_test$checkouts)
+rmse_store3_arima_checkouts <- rmse(store3_predicted_arima_checkouts$mean, df_store3_checkouts_test$checkouts)
+
+rmse_store1_arima_checkins <- rmse(store1_predicted_arima_checkins$mean, df_store1_checkins_test$checkins)
+rmse_store2_arima_checkins <- rmse(store2_predicted_arima_checkins$mean, df_store2_checkins_test$checkins)
+rmse_store3_arima_checkins <- rmse(store3_predicted_arima_checkins$mean, df_store3_checkins_test$checkins)
+
+cat("RMSE SARIMA Store1 Check-outs: ",round(rmse_store1_arima_checkouts,2))
+cat("RMSE SARIMA Store2 Check-outs: ",round(rmse_store2_arima_checkouts,2))
+cat("RMSE SARIMA Store3 Check-outs: ",round(rmse_store3_arima_checkouts,2))
+
+cat("RMSE SARIMA Store1 Check-ins: ",round(rmse_store1_arima_checkins,2))
+cat("RMSE SARIMA Store2 Check-ins: ",round(rmse_store2_arima_checkins,2))
+cat("RMSE SARIMA Store3 Check-ins: ",round(rmse_store3_arima_checkins,2))
+```
+
+### Random Forest
+
+For the hyperparameter tuning of the random forest algorithm, I conducted several experiments primarily focused on adjusting the number of trees and the number of variables to randomly sample as candidates at each split. I will omit the details of those experiments in this response.
+
+```{r}
+store1_checkouts <- df_store1_checkouts_training$checkouts
+store2_checkouts <- df_store2_checkouts_training$checkouts
+store3_checkouts <- df_store3_checkouts_training$checkouts
+
+store1_checkins <- df_store1_checkins_training$checkins
+store2_checkins <- df_store2_checkins_training$checkins
+store3_checkins <- df_store3_checkins_training$checkins
+
+# Exclude the dependent variable (checkins & checkouts) & date, and the weekend column from the exogenous variables dataframe
+store1_checkouts_features <- df_store1_checkouts_training[, -(1:3)]
+store2_checkouts_features <- df_store2_checkouts_training[, -(1:3)]
+store3_checkouts_features <- df_store3_checkouts_training[, -(1:3)]
+
+store1_checkins_features <- df_store1_checkins_training[, -(1:3)]
+store2_checkins_features <- df_store2_checkins_training[, -(1:3)]
+store3_checkins_features <- df_store3_checkins_training[, -(1:3)]
+
+# Convert exogenous variables dataframe to a numeric matrix
+store1_checkouts_matrix_features <- as.matrix(store1_checkouts_features)
+store2_checkouts_matrix_features <- as.matrix(store2_checkouts_features)
+store3_checkouts_matrix_features <- as.matrix(store3_checkouts_features)
+
+store1_checkins_matrix_features <- as.matrix(store1_checkins_features)
+store2_checkins_matrix_features <- as.matrix(store2_checkins_features)
+store3_checkins_matrix_features <- as.matrix(store3_checkins_features)
+
+# Fit the random forest models
+rf_store1_checkouts <- randomForest(x = store1_checkouts_matrix_features, y = store1_checkouts, ntree = 1000, mtry = 6)
+rf_store2_checkouts <- randomForest(x = store2_checkouts_matrix_features, y = store2_checkouts, ntree = 1000, mtry = 6)
+rf_store3_checkouts <- randomForest(x = store3_checkouts_matrix_features, y = store3_checkouts, ntree = 1000, mtry = 6)
+
+rf_store1_checkins <- randomForest(x = store1_checkins_matrix_features, y = store1_checkins, ntree = 1000, mtry = 6)
+rf_store2_checkins <- randomForest(x = store2_checkins_matrix_features, y = store2_checkins, ntree = 1000, mtry = 6)
+rf_store3_checkins <- randomForest(x = store3_checkins_matrix_features, y = store3_checkins, ntree = 1000, mtry = 6)
+
+# predictions
+store1_test_checkouts <- df_store1_checkouts_test$checkouts
+store2_test_checkouts <- df_store2_checkouts_test$checkouts
+store3_test_checkouts <- df_store3_checkouts_test$checkouts
+
+store1_test_checkins <- df_store1_checkins_test$checkins
+store2_test_checkins <- df_store2_checkins_test$checkins
+store3_test_checkins <- df_store3_checkins_test$checkins
+
+# Exclude the dependent variable from the exogenous variables dataframe
+store1_checkouts_test_features <- df_store1_checkouts_test[, -2]
+store2_checkouts_test_features <- df_store2_checkouts_test[, -2]
+store3_checkouts_test_features <- df_store3_checkouts_test[, -2]
+
+store1_checkins_test_features <- df_store1_checkins_test[, -2]
+store2_checkins_test_features <- df_store2_checkins_test[, -2]
+store3_checkins_test_features <- df_store3_checkins_test[, -2]
+
+predictions_store1_checkouts <- predict(rf_store1_checkouts, newdata = store1_checkouts_test_features)
+predictions_store2_checkouts <- predict(rf_store2_checkouts, newdata = store2_checkouts_test_features)
+predictions_store3_checkouts <- predict(rf_store3_checkouts, newdata = store3_checkouts_test_features)
+
+predictions_store1_checkins <- predict(rf_store1_checkins, newdata = store1_checkins_test_features)
+predictions_store2_checkins <- predict(rf_store2_checkins, newdata = store2_checkins_test_features)
+predictions_store3_checkins <- predict(rf_store3_checkins, newdata = store3_checkins_test_features)
+
+rmse_store1_rf_checkouts <- rmse(predictions_store1_checkouts, store1_test_checkouts)
+rmse_store2_rf_checkouts <- rmse(predictions_store2_checkouts, store2_test_checkouts)
+rmse_store3_rf_checkouts <- rmse(predictions_store3_checkouts, store3_test_checkouts)
+
+rmse_store1_rf_checkins <- rmse(predictions_store1_checkins, store1_test_checkins)
+rmse_store2_rf_checkins <- rmse(predictions_store2_checkins, store2_test_checkins)
+rmse_store3_rf_checkins <- rmse(predictions_store3_checkins, store3_test_checkins)
+
+cat("RMSE Random Forest Store1 Check-outs: ",round(rmse_store1_rf_checkouts,2))
+cat("RMSE Random Forest Store2 Check-outs: ",round(rmse_store2_rf_checkouts,2))
+cat("RMSE Random Forest Store3 Check-outs: ",round(rmse_store3_rf_checkouts,2))
+
+cat("RMSE Random Forest Store1 Check-ins: ",round(rmse_store1_rf_checkins,2))
+cat("RMSE Random Forest Store2 Check-ins: ",round(rmse_store2_rf_checkins,2))
+cat("RMSE Random Forest Store3 Check-ins: ",round(rmse_store3_rf_checkins,2))
+```
+
+### Results
+
+The table below presents the results, indicating that the OLS model performs significantly worse compared to the SARIMA and random forest models for Store2 and Store3. The random forest performs better than linear regression, which suggests that this machine learning algorithm captures non-linear patterns within the data for Store2 and Store3. However, the SARIMA model effectively utilizes the autoregressive structure present in the data, demonstrating its impressive capability. This once again highlights the power of leveraging the autoregressive properties of a time series. It is worth noting that I intentionally excluded the creation of lagged variables in this analysis to highlight this.
+
+#### Check-outs
+| Algortihm                  | Store 1  | Store 2  | Store 3  |                                                                          
+|:---------------------------|:---------|:---------|:---------|
+| OLS                        | 73.38    | 119.46   |  149.75  |                                                     
+| SARIMA                     | 34.81    | 28.92    |  37.41   |                                                                
+| Random Forest              | 87.93    | 83.20    |  78.42   |           
+
+#### Check-ins
+| Algortihm                  | Store 1  | Store 2  | Store 3  |                                                                          
+|:---------------------------|:---------|:---------|:---------|
+| OLS                        | 69.65    | 129.89   |  147.09  |                                                     
+| SARIMA                     | 29.62    | 32.08    |  28.09   |                                                                
+| Random Forest              | 72.82    | 90.64    |  81.29   |                                                           
+
+## References
+
+Bandara, K., Hyndman, R.J., & Bergmeir, C. (2021). MSTL: A
+Seasonal-Trend Decomposition Algorithm for Time Series with Multiple
+Seasonal Patterns. *arXiv preprint 2107.13462.*
+<https://arxiv.org/abs/2107.13462>.
+
+Hyndman, R.J., & Khandakar, Y. (2008). Automatic time series
+forecasting: The forecast package for R, *Journal of Statistical
+Software*, *26(3)*, 1--22. <https://doi.org/10.18637/jss.v027.i03>.
+
+Huber, J., & Stuckenschmidt, H. (2020). Daily retail demand forecasting
+using machine learning with emphasis on calendric special days.
+*International Journal of Forecasting*, *36(4)*, 1420-1438,
+<https://doi.org/10.1016/j.ijforecast.2020.02.005>.
+
+Sheta, A.F., De Jong, K. (2001). Time-series forecasting using GA-tuned
+radial basis functions, *Information Sciences*, *133(3-4)* ,221-228.
+[https://doi.org/10.1016/S0020-0255(01)00086-X](https://doi.org/10.1016/S0020-0255(01)00086-X){.uri}.
